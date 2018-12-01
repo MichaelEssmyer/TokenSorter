@@ -1,0 +1,370 @@
+// movement interface using cartesian geometry strategy
+
+#ifndef ALL_FUNC_WHEELS_MOTORCONTROLLER_H
+#define ALL_FUNC_WHEELS_MOTORCONTROLLER_H
+
+#include "MovementInterfaceBase.h"
+#include "Buttons.h"
+#include "ClassThatKeepsCoordinatesFromDistances.h"
+
+#define TRAVEL_SEGMENT_COUNT 10  // the number of segments to break the travel into
+
+#define FORWARD_TRAVEL_DURATION 3000  // milliseconds for one grid move
+const int FORWARD_SEGMENT_DURATION = FORWARD_TRAVEL_DURATION / TRAVEL_SEGMENT_COUNT;
+
+#define TURN_TRAVEL_DURATION 1500  // milliseconds to turn
+const int TURN_SEGMENT_DURATION = TURN_TRAVEL_DURATION / TRAVEL_SEGMENT_COUNT;
+
+// TODO: tune with average values in log
+// one motor consistently weaker than the other? make its number higher here
+// TODO: these should also be a function of duration - I'm tired of math
+const double STARTING_FORWARD_POWER_PER_DISTANCE_NEEDED_FOR_LEFT
+        = 1.36;
+const double STARTING_FORWARD_POWER_PER_DISTANCE_NEEDED_FOR_RIGHT
+        = 1.36;
+const double STARTING_TURN_POWER_PER_DISTANCE_NEEDED_FOR_LEFT
+        = 1.8;  // absolute values
+const double STARTING_TURN_POWER_PER_DISTANCE_NEEDED_FOR_RIGHT
+        = 1.8;
+
+class GlobalCoordinates : public ClassThatKeepsCoordinatesFromDistances
+{
+public:
+    long distancesLeft[TRAVEL_SEGMENT_COUNT];
+    long distancesRight[TRAVEL_SEGMENT_COUNT];
+
+    void calculateForAll()
+    {
+        long distances[MOTOR_COUNT];
+        for (size_t i = 0; i < TRAVEL_SEGMENT_COUNT; ++i) {
+            distances[LEFT] = distancesLeft[i];
+            distances[RIGHT] = distancesRight[i];
+            calculateNewCoordinates(distances);
+        }
+#ifdef VERBOSE
+        Serial.print(coordinates.x[LEFT]);
+        Serial.print(' ');
+        Serial.println(coordinates.y[LEFT]);
+#endif  // VERBOSE
+    }
+
+    void save(const size_t& index, long distances[MOTOR_COUNT]) {
+        distancesLeft[index] = distances[LEFT];
+        distancesRight[index] = distances[RIGHT];
+    }
+};
+
+class MovementInterface : public MovementInterfaceBase, public ClassThatKeepsCoordinatesFromDistances
+{
+public:  // private
+
+    double forwardPowerPerDistance[MOTOR_COUNT];  // the power needed to travel twelve inches / number of segments
+    double turnPowerPerDistance[MOTOR_COUNT];
+
+    // inherited
+    // RobotCoordinates coordinates;  // relative from where I started this movement
+
+    GlobalCoordinates global;  // for the whole grid, doesn't reset with each move
+
+    int travelSegmentsRemaining;  // counts down
+
+    /** reset everything for a new movement */
+    void reset()
+    {
+        coordinates.x[LEFT] = 0;
+        coordinates.y[LEFT] = 0;
+        coordinates.x[RIGHT] = WHEEL_WIDTH;
+        coordinates.y[RIGHT] = 0;
+
+        travelSegmentsRemaining = TRAVEL_SEGMENT_COUNT;
+
+        global.calculateForAll();
+
+        startEncoderValues[LEFT] = motorInterface->readEncoder(LEFT);
+        startEncoderValues[RIGHT] = motorInterface->readEncoder(RIGHT);
+    }
+
+    /** elapse the amount of time we want to take to travel twelve inches * amount / segment count */
+    void passTime(const size_t& movementType, const int& amount=1)
+    {
+        long stopTime;
+        if (movementType == FORWARD)
+        {
+            stopTime = millis() + (FORWARD_SEGMENT_DURATION * amount);
+        }
+        else  // turn
+        {
+            stopTime = millis() + (TURN_SEGMENT_DURATION * amount);
+        }
+        while (millis() < stopTime) ;
+    }
+
+    /**
+     *  pythagorean theorem - distance from where we want wheel to end
+     *  if it has gone too far, it returns 0 (not negative)
+     *
+     *  whichMovement is LEFT, RIGHT, FORWARD
+     *  whichWheel is LEFT, RIGHT
+     *  howMuchXMatters is on a scale of 0 to 2 - default 1 is real pythagorean distance
+     */
+    double distanceFromGoal(const size_t& whichMovement, const size_t& whichWheel, const double& howMuchXMatters = 1)
+    {
+        double xDifference;
+        double yDifference;
+
+        if (whichMovement == FORWARD)
+        {
+            xDifference = (whichWheel * WHEEL_WIDTH) - coordinates.x[whichWheel];
+            yDifference = TWELVE_INCH_DISTANCE - coordinates.y[whichWheel];
+            if (yDifference < 0)  // too far
+                return 0;
+        }
+        else  // LEFT or RIGHT
+        {
+            xDifference = WHEEL_WIDTH / 2 - coordinates.x[whichWheel];
+            if (xDifference < 0 && whichWheel == LEFT)  // too far
+                return 0;
+            if (xDifference > 0 && whichWheel == RIGHT)  // too far
+                return 0;
+
+            if (whichMovement == LEFT)
+            {
+                yDifference = (WHEEL_WIDTH * (whichWheel - 0.5)) - coordinates.y[whichWheel];
+            }
+            else  // RIGHT
+            {
+                yDifference = (WHEEL_WIDTH * (0.5 - whichWheel)) - coordinates.y[whichWheel];
+            }
+        }
+
+        return sqrt(howMuchXMatters * xDifference*xDifference + (2-howMuchXMatters) * yDifference*yDifference);
+    }
+
+    /**
+     *  on a scale of 0 to 2, how much we care about x axis in movement
+     *  movement is LEFT (0) or RIGHT (1) or anything else being forward
+     */
+    double howMuchToCareAboutX(const size_t& movementType)
+    {
+        if (movementType == LEFT || movementType == RIGHT)
+        {
+            // care more about y at the beginning and more about x later
+            // from .33 to 1.67
+            return ((TRAVEL_SEGMENT_COUNT - travelSegmentsRemaining) * 1.8 / TRAVEL_SEGMENT_COUNT) + 0.1;
+        }
+        // care more about x at the beginning of the move, less at the end
+        // from 1.67 to 0
+        return 1.6667 * travelSegmentsRemaining / TRAVEL_SEGMENT_COUNT;
+    }
+
+    /**
+     *  power per distance that I found I make
+     *  with exponential weighted average
+     */
+    double proportionalPowerPerDistance(const double &progressMade,
+                                        const int &powerGaveForThisSegment,
+                                        const double &previousPowerPerDistance)
+    {
+        if (progressMade)  // > 0
+        {
+            return ((powerGaveForThisSegment / progressMade) + previousPowerPerDistance) / 2;
+        }
+        else  // didn't move
+        {
+            return previousPowerPerDistance;
+        }
+    }
+
+public:
+    // constructor
+    MovementInterface(MotorInterfaceBase* _motorInterface, Buttons* _buttons)
+            : MovementInterfaceBase(_motorInterface, _buttons)
+    {
+        forwardPowerPerDistance[LEFT] = STARTING_FORWARD_POWER_PER_DISTANCE_NEEDED_FOR_LEFT;
+        forwardPowerPerDistance[RIGHT] = STARTING_FORWARD_POWER_PER_DISTANCE_NEEDED_FOR_RIGHT;
+        turnPowerPerDistance[LEFT] = STARTING_TURN_POWER_PER_DISTANCE_NEEDED_FOR_LEFT;
+        turnPowerPerDistance[RIGHT] = STARTING_TURN_POWER_PER_DISTANCE_NEEDED_FOR_RIGHT;
+    }
+
+    /** movementType is FORWARD, LEFT, RIGHT */
+    void go(const size_t& movementType)
+    {
+        reset();
+
+        long previousEncoderReading[MOTOR_COUNT];
+        long newEncoderReading[MOTOR_COUNT];
+        long distancesTraveledThisTime[MOTOR_COUNT];
+        double previousDistanceFromGoal[MOTOR_COUNT];
+        double newDistanceFromGoal[MOTOR_COUNT];
+        double progressMade[MOTOR_COUNT];
+        double progressNeedToMake[MOTOR_COUNT];
+        int powerToGive[MOTOR_COUNT];
+
+        double howMuchWeCareAboutXThisTime;
+
+        long totalPower[MOTOR_COUNT];  // excluding first and last - for taking the average
+        totalPower[LEFT] = 0;
+        totalPower[RIGHT] = 0;
+
+        double* powerPerDistanceForThisMovement[MOTOR_COUNT];
+        int direction[MOTOR_COUNT];  // 1 or -1 depending on movementType
+
+        if (movementType == FORWARD)
+        {
+            powerPerDistanceForThisMovement[LEFT] = &forwardPowerPerDistance[LEFT];
+            powerPerDistanceForThisMovement[RIGHT] = &forwardPowerPerDistance[RIGHT];
+            *(powerPerDistanceForThisMovement[LEFT]) = STARTING_FORWARD_POWER_PER_DISTANCE_NEEDED_FOR_LEFT;
+            *(powerPerDistanceForThisMovement[RIGHT]) = STARTING_FORWARD_POWER_PER_DISTANCE_NEEDED_FOR_RIGHT;
+            direction[LEFT] = 1;
+            direction[RIGHT] = 1;
+        }
+        else  // turn
+        {
+            powerPerDistanceForThisMovement[LEFT] = &turnPowerPerDistance[LEFT];
+            powerPerDistanceForThisMovement[RIGHT] = &turnPowerPerDistance[RIGHT];
+            *(powerPerDistanceForThisMovement[LEFT]) = STARTING_TURN_POWER_PER_DISTANCE_NEEDED_FOR_LEFT;
+            *(powerPerDistanceForThisMovement[RIGHT]) = STARTING_TURN_POWER_PER_DISTANCE_NEEDED_FOR_RIGHT;
+            if (movementType == LEFT)
+            {
+                direction[LEFT] = -1;
+                direction[RIGHT] = 1;
+            }
+            else  // RIGHT
+            {
+                direction[LEFT] = 1;
+                direction[RIGHT] = -1;
+            }
+        }
+
+        // get encoder readings before we start moving
+        previousEncoderReading[LEFT] = motorInterface->readEncoder(LEFT);
+        previousEncoderReading[RIGHT] = motorInterface->readEncoder(RIGHT);
+
+        while (travelSegmentsRemaining > 0 && buttons->getStopState() == '0')
+        {
+            // look for the average power over the segments - excluding first and last because they are often anomalies
+            if (travelSegmentsRemaining > 1 && travelSegmentsRemaining < (TRAVEL_SEGMENT_COUNT - 1))
+            {
+                totalPower[LEFT] += *(powerPerDistanceForThisMovement[LEFT]);
+                totalPower[RIGHT] += *(powerPerDistanceForThisMovement[RIGHT]);
+            }
+
+            howMuchWeCareAboutXThisTime = howMuchToCareAboutX(movementType);
+
+            // TODO: disable this because serial communication can affect timing
+            // TODO: don't remove if we haven't done a lot of testing without it
+#ifdef VERBOSE
+            Serial.print("time left ");
+            Serial.println(travelSegmentsRemaining);
+            /*
+            Serial.print(" input left ");
+            Serial.print(*(powerPerDistanceForThisMovement[LEFT]));
+            Serial.print(" right ");
+            Serial.println(*(powerPerDistanceForThisMovement[RIGHT]));
+             */
+#endif  // VERBOSE
+
+            previousDistanceFromGoal[LEFT] = distanceFromGoal(movementType, LEFT, howMuchWeCareAboutXThisTime);
+            previousDistanceFromGoal[RIGHT] = distanceFromGoal(movementType, RIGHT, howMuchWeCareAboutXThisTime);
+
+            /*Serial.print("I see distance from my goal ");
+            Serial.print(previousDistanceFromGoal[LEFT]);
+            Serial.print(' ');
+            Serial.println(previousDistanceFromGoal[RIGHT]);*/
+
+            // distance I need to go this segment
+            progressNeedToMake[LEFT] = previousDistanceFromGoal[LEFT] / travelSegmentsRemaining;
+            progressNeedToMake[RIGHT] = previousDistanceFromGoal[RIGHT] / travelSegmentsRemaining;
+
+            /*Serial.print("In this segment I want to go ");
+            Serial.print(progressNeedToMake[LEFT]);
+            Serial.print(' ');
+            Serial.println(progressNeedToMake[RIGHT]);*/
+            
+            powerToGive[LEFT] = motorSpeedLimit((int)round(progressNeedToMake[LEFT] *
+                                                           *(powerPerDistanceForThisMovement[LEFT])));
+            powerToGive[RIGHT] = motorSpeedLimit((int)round(progressNeedToMake[RIGHT] *
+                                                            *(powerPerDistanceForThisMovement[RIGHT])));
+
+#ifdef VERBOSE
+            Serial.print("giving the motors power: ");
+            Serial.print(powerToGive[LEFT]);
+            Serial.print(' ');
+            Serial.println(powerToGive[RIGHT]);
+#endif
+
+            motorInterface->setMotorPower(LEFT, powerToGive[LEFT], direction[LEFT]);
+            motorInterface->setMotorPower(RIGHT, powerToGive[RIGHT], direction[RIGHT]);
+
+            passTime(movementType);
+            --travelSegmentsRemaining;
+
+            newEncoderReading[LEFT] = motorInterface->readEncoder(LEFT);
+            newEncoderReading[RIGHT] = motorInterface->readEncoder(RIGHT);
+
+            distancesTraveledThisTime[LEFT] = newEncoderReading[LEFT] - previousEncoderReading[LEFT];
+            distancesTraveledThisTime[RIGHT] = newEncoderReading[RIGHT] - previousEncoderReading[RIGHT];
+
+            /*Serial.print("This is the distance each wheel traveled ");
+            Serial.print(distancesTraveledThisTime[LEFT]);
+            Serial.print(' ');
+            Serial.println(distancesTraveledThisTime[RIGHT]);*/
+            
+            // next time's previousEncoderReading is this time's newEncoderReading
+            previousEncoderReading[LEFT] = newEncoderReading[LEFT];
+            previousEncoderReading[RIGHT] = newEncoderReading[RIGHT];
+
+            global.save((size_t)travelSegmentsRemaining, distancesTraveledThisTime);
+
+            calculateNewCoordinates(distancesTraveledThisTime);
+
+            // TODO: test whether we get better results if we do this the last time
+            if (travelSegmentsRemaining)  // don't do this the last time
+            {
+                newDistanceFromGoal[LEFT] = distanceFromGoal(movementType, LEFT, howMuchWeCareAboutXThisTime);
+                newDistanceFromGoal[RIGHT] = distanceFromGoal(movementType, RIGHT, howMuchWeCareAboutXThisTime);
+
+                progressMade[LEFT] = previousDistanceFromGoal[LEFT] - newDistanceFromGoal[LEFT];
+                progressMade[RIGHT] = previousDistanceFromGoal[RIGHT] - newDistanceFromGoal[RIGHT];
+
+                /*
+                double previousPowerPerDistance[MOTOR_COUNT];  // power per distance used this last time
+
+                previousPowerPerDistance[LEFT] = *(powerPerDistanceForThisMovement[LEFT]);
+                previousPowerPerDistance[RIGHT] = *(powerPerDistanceForThisMovement[RIGHT]);
+                 */
+
+                // update power per distance with information gathered
+                if (travelSegmentsRemaining != TRAVEL_SEGMENT_COUNT - 1)  // not first time because motors take time to start
+                {
+                    *(powerPerDistanceForThisMovement[LEFT])
+                            = proportionalPowerPerDistance(progressMade[LEFT],
+                                                           powerToGive[LEFT],
+                                                           *(powerPerDistanceForThisMovement[LEFT]));
+                    *(powerPerDistanceForThisMovement[RIGHT])
+                            = proportionalPowerPerDistance(progressMade[RIGHT],
+                                                           powerToGive[RIGHT],
+                                                           *(powerPerDistanceForThisMovement[RIGHT]));
+                }
+                // TODO: try different weighted averaging schemes
+            }
+
+        }
+
+        motorInterface->setMotorPower(LEFT, 0, 1);
+        motorInterface->setMotorPower(RIGHT, 0, 1);
+
+        // calculate average power
+        double average[MOTOR_COUNT];
+        average[LEFT] = (double)(totalPower[LEFT]) / (TRAVEL_SEGMENT_COUNT - 2);  // minus first and last
+        average[RIGHT] = (double)(totalPower[RIGHT]) / (TRAVEL_SEGMENT_COUNT - 2);
+#ifdef VERBOSE
+        Serial.print("average left power: ");
+        Serial.println(average[LEFT]);
+        Serial.print("average right power: ");
+        Serial.println(average[RIGHT]);
+#endif  // VERBOSE
+    }
+};
+
+#endif //ALL_FUNC_WHEELS_MOTORCONTROLLER_H
